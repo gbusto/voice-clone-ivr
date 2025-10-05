@@ -14,7 +14,9 @@ export default function ProfilePage() {
   const [text, setText] = useState('');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
+  const [generating, setGenerating] = useState(false);
   const hasVoices = voices.length > 0;
+  const orpheusVoices = ["tara", "zac", "zoe"]; // built-in Orpheus voices
 
   const fetchMe = async () => {
     const r = await fetch('/api/me');
@@ -26,7 +28,13 @@ export default function ProfilePage() {
     setEmail(j.email);
     setPhone(j.phone || '');
     setVoices(j.voices || []);
-    if (!selectedVoiceId && j.voices?.[0]) setSelectedVoiceId(j.voices[0].voice_id);
+    if (!selectedVoiceId) {
+      if (j.voices?.[0]) {
+        setSelectedVoiceId(j.voices[0].voice_id);
+      } else {
+        setSelectedVoiceId('orpheus:tara');
+      }
+    }
   };
 
   useEffect(() => { fetchMe(); }, []);
@@ -49,10 +57,52 @@ export default function ProfilePage() {
 
   const speak = async () => {
     if (!selectedVoiceId || !text.trim()) return;
-    const r = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ voice_id: selectedVoiceId, text }) });
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    setAudioUrl(url);
+    setGenerating(true);
+    setAudioUrl(null);
+    try {
+      // Start TTS job
+      const r = await fetch('/api/tts', { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ voice_id: selectedVoiceId, text }) 
+      });
+      if (!r.ok) {
+        throw new Error(`TTS failed: ${r.status}`);
+      }
+      const { job_id } = await r.json();
+      
+      // Poll for completion
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`/api/tts/jobs/${job_id}`);
+          if (!statusRes.ok) {
+            clearInterval(pollInterval);
+            throw new Error(`Job status check failed: ${statusRes.status}`);
+          }
+          const status = await statusRes.json();
+          
+          if (status.status === 'completed') {
+            clearInterval(pollInterval);
+            setAudioUrl(status.audio_url);
+            setGenerating(false);
+          } else if (status.status === 'failed') {
+            clearInterval(pollInterval);
+            throw new Error(status.error_message || 'TTS generation failed');
+          }
+          // If still pending or processing, keep polling
+        } catch (pollErr) {
+          clearInterval(pollInterval);
+          console.error('Polling error:', pollErr);
+          alert('Failed to check job status. Check console for details.');
+          setGenerating(false);
+        }
+      }, 2000); // Poll every 2 seconds
+      
+    } catch (err) {
+      console.error('TTS error:', err);
+      alert('Failed to generate audio. Check console for details.');
+      setGenerating(false);
+    }
   };
 
   const logout = async () => {
@@ -109,11 +159,18 @@ export default function ProfilePage() {
                   onChange={e => setSelectedVoiceId(e.target.value)}
                   className="w-full px-4 py-3 bg-gray-700 border border-gray-600 text-white rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition"
                 >
-                  {hasVoices ? (
-                    voices.map(v => <option key={v.voice_id} value={v.voice_id}>{v.name}</option>)
-                  ) : (
-                    <option value="">No voices yet—create one</option>
-                  )}
+                  <optgroup label="Orpheus (built-in)">
+                    {orpheusVoices.map(v => (
+                      <option key={`orpheus:${v}`} value={`orpheus:${v}`}>{v}</option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Your Voices">
+                    {hasVoices ? (
+                      voices.map(v => <option key={v.voice_id} value={v.voice_id}>{v.name}</option>)
+                    ) : (
+                      <option value="" disabled>No voices yet—create one</option>
+                    )}
+                  </optgroup>
                 </select>
               </div>
               <button
@@ -138,17 +195,26 @@ export default function ProfilePage() {
               placeholder="Type or paste text here to synthesize with your cloned voice..."
               value={text}
               onChange={e => setText(e.target.value)}
-              className="w-full px-4 py-3 bg-gray-700 border border-gray-600 text-white placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition resize-none"
+              disabled={generating}
+              className="w-full px-4 py-3 bg-gray-700 border border-gray-600 text-white placeholder-gray-400 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition resize-none disabled:opacity-50"
             />
             <button
               onClick={speak}
-              disabled={!hasVoices || !text.trim()}
+              disabled={!selectedVoiceId || !text.trim() || generating}
               className="mt-4 w-full sm:w-auto px-8 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition shadow-md hover:shadow-lg"
             >
-              🎤 Speak
+              {generating ? '⏳ Generating...' : '🎤 Speak'}
             </button>
             
-            {audioUrl && (
+            {generating && (
+              <div className="mt-4 p-4 bg-indigo-900/30 rounded-lg border border-indigo-700">
+                <p className="text-sm text-indigo-300 font-medium">
+                  🎵 Generating audio... This may take 1-2 minutes for Orpheus voices.
+                </p>
+              </div>
+            )}
+
+            {audioUrl && !generating && (
               <div className="mt-6 p-4 bg-gray-900/50 rounded-lg border border-gray-700">
                 <p className="text-sm font-medium text-gray-300 mb-2">Generated Audio:</p>
                 <audio controls src={audioUrl} className="w-full" />

@@ -43,3 +43,15 @@ class TTSRequest(BaseModel):
     text: str
 
 
+class TTSJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class TTSJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    audio_url: Optional[str] = None
+    error_message: Optional[str] = None
+
+

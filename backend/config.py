@@ -14,6 +14,7 @@ class Settings(BaseModel):
         "sqlite:////Users/gabrielbusto/projects/fun-apps/voice-clone-ivr/backend/app.db",
     )
     ALLOWED_ORIGINS: str = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+    ORPHEUS_MODAL_ENDPOINT: str = os.getenv("ORPHEUS_MODAL_ENDPOINT", "")
 
 
 settings = Settings()

@@ -1,13 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 from typing import List
+from datetime import datetime
+import uuid
 
 from .auth import get_current_user
 from .db import get_db, engine
-from .models import User, Voice, VoiceSession
-from .schemas import MeResponse, UpdatePhoneRequest, CreateVoiceSessionResponse, VoiceOut, TTSRequest
+from .models import User, Voice, VoiceSession, TTSJob
+from .schemas import MeResponse, UpdatePhoneRequest, CreateVoiceSessionResponse, VoiceOut, TTSRequest, TTSJobResponse, TTSJobStatusResponse
 from .services.twilio_client import place_outbound_call
 from .services.elevenlabs import tts_to_mp3
+from .services.orpheus import tts_orpheus_to_wav
+from .services.tts_worker import start_tts_job_async
 
 router = APIRouter(tags=["api"])
 
@@ -68,13 +72,43 @@ def create_voice_session(user: User = Depends(get_current_user), db: Session = D
     return CreateVoiceSessionResponse(session_id=session_id)
 
 
-@router.post("/tts")
+@router.post("/tts", response_model=TTSJobResponse)
 def tts(payload: TTSRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Ensure the voice belongs to the user
-    voice = db.query(Voice).filter(Voice.voice_id == payload.voice_id, Voice.user_id == user.id).first()
-    if not voice:
-        raise HTTPException(status_code=404, detail="Voice not found")
-    audio = tts_to_mp3(payload.voice_id, payload.text)
-    return Response(content=audio, media_type="audio/mpeg")
+    # Validate voice access for custom voices
+    if not payload.voice_id.startswith("orpheus:"):
+        voice = db.query(Voice).filter(Voice.voice_id == payload.voice_id, Voice.user_id == user.id).first()
+        if not voice:
+            raise HTTPException(status_code=404, detail="Voice not found")
+    
+    # Create TTS job
+    job_id = uuid.uuid4().hex
+    job = TTSJob(
+        job_id=job_id,
+        user_id=user.id,
+        voice_id=payload.voice_id,
+        text=payload.text,
+        status="pending"
+    )
+    db.add(job)
+    db.commit()
+    
+    # Start async processing
+    start_tts_job_async(job_id)
+    
+    return TTSJobResponse(job_id=job_id, status="pending")
+
+
+@router.get("/tts/jobs/{job_id}", response_model=TTSJobStatusResponse)
+def get_tts_job_status(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    job = db.query(TTSJob).filter(TTSJob.job_id == job_id, TTSJob.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return TTSJobStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        audio_url=job.audio_url,
+        error_message=job.error_message
+    )
 
 

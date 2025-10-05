@@ -4,11 +4,11 @@ PY=python3
 
 dev:
 	@echo "Starting backend and frontend..."
-	$(PY) -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 &
+	$(PY) -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --timeout-keep-alive 300 &
 	cd frontend && npm run dev
 
 backend:
-	$(PY) -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+	$(PY) -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --timeout-keep-alive 300
 
 frontend:
 	cd frontend && npm run dev
