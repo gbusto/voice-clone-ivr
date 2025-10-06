@@ -160,23 +160,28 @@ def tts_generate(request: Dict[str, Any]):
     volumes={"/models": model_volume, "/training": training_volume},
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
 )
-def finetune_orpheus(
-    dataset_id: str,
-    base_model_path: str = "/models/orpheus-3b-0.1-ft",
-    output_dir_name: str = "orpheus-finetune-output",
-    epochs: int = 1,
-    batch_size: int = 1,
-    learning_rate: float = 1e-5,
-    save_steps: int = 200,
-    run_name: Optional[str] = None,
-    project_name: str = "orpheus-tts-finetune",
-) -> Dict[str, Any]:
+@modal.fastapi_endpoint(method="POST")
+def finetune_endpoint(request: Dict[str, Any]):
+    body = request if isinstance(request, dict) else json.loads(request)
+    dataset_id = body.get("dataset_id")
+    if not dataset_id:
+        return {"error": "dataset_id is required"}, 400
+    base_model_path = body.get("base_model_path", "/models/orpheus-3b-0.1-ft")
+    output_dir_name = body.get("output_dir_name", "orpheus-finetune-output")
+    epochs = int(body.get("epochs", 1))
+    batch_size = int(body.get("batch_size", 1))
+    learning_rate = float(body.get("learning_rate", 1e-5))
+    save_steps = int(body.get("save_steps", 200))
+    run_name = body.get("run_name")
+    project_name = body.get("project_name", "orpheus-tts-finetune")
+
+    # Ensure base model present
+    if not os.path.exists(base_model_path) or not os.listdir(base_model_path):
+        download_models.call()
+
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, AutoTokenizer
     import wandb
-
-    if not os.path.exists(base_model_path) or not os.listdir(base_model_path):
-        download_models.call()
 
     tok = AutoTokenizer.from_pretrained(base_model_path)
     model = AutoModelForCausalLM.from_pretrained(base_model_path)
@@ -229,6 +234,4 @@ def finetune_orpheus(
 #         res = finetune_orpheus.remote(dataset_id=dataset_id)
 #         print(json.dumps(res, indent=2))
 #     else:
-#         raise SystemExit("Unknown action. Use: download | serve | finetune")
-
-
+#         raise SystemExit("Unknown action. Use: download | serve | finetune")s
