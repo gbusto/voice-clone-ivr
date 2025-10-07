@@ -315,6 +315,14 @@ def voice_chat_ws():
     
     # Load model once at startup (before any connections)
     model, processor = _ensure_ws_model_loaded()
+    # Enable fast math on supported GPUs
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     
     web_app = FastAPI()
     
@@ -366,60 +374,68 @@ def voice_chat_ws():
                     chat.add_audio(wav, sampling_rate)
                     chat.end_turn()
                     
-                    # Generate response
+                    # Generate and stream response
                     chat.new_turn("assistant")
-                    
-                    text_out = []
-                    audio_out = []
-                    modality_out = []
-                    
-                    print(f"[{session_id}] Generating response...")
-                    
+                    await websocket.send_json({
+                        "type": "response_start",
+                        "audio": {"sample_rate": 24000, "format": "pcm_s16"}
+                    })
+
+                    text_tokens = []
+                    audio_tokens = []
+                    last_sent_idx = 0
+                    chunk_stride = 8  # decode and send audio every N steps
+
+                    print(f"[{session_id}] Generating response (streaming)...")
+
                     with torch.no_grad():
                         for t in model.generate_interleaved(
                             **chat,
                             max_new_tokens=512,
                             audio_temperature=1.0,
-                            audio_top_k=4
+                            audio_top_k=4,
                         ):
                             if t.numel() == 1:
-                                text_out.append(t)
-                                modality_out.append(LFMModality.TEXT)
+                                # Text token: stream delta
+                                text_tokens.append(t)
+                                delta = processor.text.decode(t)
+                                if delta:
+                                    await websocket.send_json({"type": "text_delta", "delta": delta})
                             else:
-                                audio_out.append(t)
-                                modality_out.append(LFMModality.AUDIO_OUT)
+                                # Audio token: accumulate and stream in chunks
+                                audio_tokens.append(t)
+                                if len(audio_tokens) - last_sent_idx >= chunk_stride:
+                                    slice_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                    with torch.no_grad():
+                                        slice_wave = processor.mimi.decode(slice_codes)[0]
+                                    pcm_i16 = (slice_wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
+                                    await websocket.send_json({"type": "audio_chunk", "size": len(pcm_i16)})
+                                    await websocket.send_bytes(pcm_i16)
+                                    last_sent_idx = len(audio_tokens)
 
-                    mimi_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
-                    with torch.no_grad():
-                        waveform = processor.mimi.decode(mimi_codes)[0]
+                    # Flush remaining audio (excluding trailing end-of-audio code)
+                    if len(audio_tokens) > last_sent_idx + 1:
+                        final_codes = torch.stack(audio_tokens[last_sent_idx:-1], 1).unsqueeze(0)
+                        if final_codes.shape[2] > 0:
+                            with torch.no_grad():
+                                final_wave = processor.mimi.decode(final_codes)[0]
+                            final_pcm = (final_wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
+                            await websocket.send_json({"type": "audio_chunk", "size": len(final_pcm)})
+                            await websocket.send_bytes(final_pcm)
 
-                    wav_buffer = io.BytesIO()
-                    torchaudio.save(
-                        wav_buffer,
-                        waveform.cpu(),
-                        24_000,
-                        format="wav",
-                    )
-
-                    chat.append(
-                        text = torch.stack(text_out, 1),
-                        audio_out = torch.stack(audio_out, 1),
-                        modality_flag = torch.tensor(modality_out)
-                    )
+                    # Append generated tokens to chat history
+                    if text_tokens or audio_tokens:
+                        modality = ([LFMModality.TEXT] * len(text_tokens)) + ([LFMModality.AUDIO_OUT] * len(audio_tokens))
+                        chat.append(
+                            text=torch.stack(text_tokens, 1) if text_tokens else chat.text.new_empty((1, 0)),
+                            audio_out=torch.stack(audio_tokens, 1) if audio_tokens else chat.audio_out.new_empty((chat.audio_out.shape[0], 0)),
+                            modality_flag=torch.tensor(modality).unsqueeze(0),
+                        )
                     chat.end_turn()
-                                        
-                    # Decode audio
-                    response_text = processor.text.decode(torch.cat(text_out)) if text_out else ""
-                    response_audio = wav_buffer.getvalue()
 
-                    await websocket.send_json({
-                        "type": "response",
-                        "text": response_text,
-                        "audio_size": len(response_audio)
-                    })
-                    await websocket.send_bytes(response_audio)
-                    
-                    print(f"[{session_id}] Sent response: {response_text[:50]}...")
+                    full_text = processor.text.decode(torch.cat(text_tokens)) if text_tokens else ""
+                    await websocket.send_json({"type": "response_end", "text": full_text})
+                    print(f"[{session_id}] Response done: {full_text[:50]}...")
                                        
                     CHAT_SESSIONS[session_id]["turn_count"] += 1
                     

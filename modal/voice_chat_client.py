@@ -149,24 +149,42 @@ class VoiceChatClient:
                             print(f"📤 Sending {len(audio_wav)} bytes...")
                             await websocket.send(audio_wav)
                             
-                            # Wait for response
-                            print("⏳ Waiting for response...")
-                            
-                            # Receive JSON metadata
-                            response_meta = await websocket.recv()
-                            meta_data = json.loads(response_meta)
-                            
-                            if meta_data.get("type") == "response":
-                                response_text = meta_data.get("text", "")
-                                print(f"\n💬 Assistant: {response_text}")
-                                
-                                # Receive audio bytes
-                                response_audio = await websocket.recv()
-                                print(f"🔊 Playing response ({len(response_audio)} bytes)...")
-                                self.play_audio(response_audio)
-                                print("✨ Done!\n")
-                            elif meta_data.get("type") == "error":
-                                print(f"❌ Error: {meta_data.get('message')}")
+                            # Stream response
+                            print("⏳ Waiting for response (streaming)...")
+
+                            # Open output stream for low-latency playback
+                            stream = sd.OutputStream(samplerate=self.sample_rate, channels=1, dtype='float32')
+                            stream.start()
+
+                            accumulated_text = []
+                            while True:
+                                msg = await websocket.recv()
+                                try:
+                                    data = json.loads(msg)
+                                except Exception:
+                                    # Binary frame (raw PCM S16LE)
+                                    pcm = msg
+                                    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                                    stream.write(audio.reshape(-1, 1))
+                                    continue
+
+                                mtype = data.get("type")
+                                if mtype == "text_delta":
+                                    delta = data.get("delta", "")
+                                    accumulated_text.append(delta)
+                                    sys.stdout.write(delta)
+                                    sys.stdout.flush()
+                                elif mtype == "audio_chunk":
+                                    # size metadata; actual bytes will arrive next frame (binary)
+                                    pass
+                                elif mtype == "response_end":
+                                    stream.stop(); stream.close()
+                                    print("\n✨ Done!\n")
+                                    break
+                                elif mtype == "error":
+                                    stream.stop(); stream.close()
+                                    print(f"❌ Error: {data.get('message')}")
+                                    break
                         
                         self.recorded_frames = []
             
