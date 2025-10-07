@@ -22,13 +22,14 @@ except ImportError:
 
 
 class VoiceChatClient:
-    def __init__(self, ws_url: str, sample_rate: int = 24000):
+    def __init__(self, ws_url: str, sample_rate: int = 24000, show_metrics: bool = False):
         self.ws_url = ws_url
         self.sample_rate = sample_rate
         self.recording = False
         self.recorded_frames = []
         self.websocket = None
         self.session_id = None
+        self.show_metrics = show_metrics
         
     def on_press(self, key):
         """Called when a key is pressed"""
@@ -168,9 +169,9 @@ class VoiceChatClient:
                                     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
                                     if not primed:
                                         pending_audio.append(audio)
-                                        # Prime when we have ~100 ms buffered
+                                        # Prime when we have ~50ms buffered (reduced for faster start)
                                         total_len = sum(a.shape[0] for a in pending_audio)
-                                        if total_len >= int(0.2 * self.sample_rate):
+                                        if total_len >= int(0.05 * self.sample_rate):
                                             stream.start()
                                             primed = True
                                             # Flush buffer
@@ -196,6 +197,12 @@ class VoiceChatClient:
                                     stream.close()
                                     print("\n✨ Done!\n")
                                     break
+                                elif mtype == "metrics":
+                                    if self.show_metrics:
+                                        metrics = {k: data.get(k) for k in sorted(data.keys()) if k != "type"}
+                                        print("\n📊 Metrics:")
+                                        for k, v in metrics.items():
+                                            print(f"  - {k}: {v}")
                                 elif mtype == "error":
                                     if primed:
                                         stream.stop()
@@ -223,6 +230,11 @@ async def main():
         default=24000,
         help="Audio sample rate (default: 24000)"
     )
+    parser.add_argument(
+        "--show-metrics",
+        action="store_true",
+        help="Print server-sent metrics (requires server tracing enabled)"
+    )
     
     args = parser.parse_args()
     
@@ -232,7 +244,7 @@ async def main():
         sys.exit(1)
     
     # Create and run client
-    client = VoiceChatClient(args.url, args.sample_rate)
+    client = VoiceChatClient(args.url, args.sample_rate, show_metrics=args.show_metrics)
     
     try:
         await client.conversation_loop()
