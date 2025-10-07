@@ -296,7 +296,7 @@ def _ensure_ws_model_loaded():
 
 @app.function(
     image=lfm2_image,
-    gpu="A100-40GB",
+    gpu="T4",
     volumes={"/models": model_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=600,  # Keep alive 10 minutes for conversations
@@ -419,15 +419,18 @@ def voice_chat_ws():
                                 if slice_codes.shape[2] <= 0:
                                     continue
                                 try:
+                                    target_device = processor.device if hasattr(processor, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+                                    codes_dev = slice_codes.to(device=target_device, dtype=torch.long, non_blocking=True).contiguous()
                                     if stream is not None:
                                         with torch.cuda.stream(stream):
-                                            wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
+                                            wave = processor.mimi.decode(codes_dev)[0]
                                             pcm = (wave.clamp(-1, 1) * 32767.0).to(torch.int16)
+                                        # ensure decode finished before CPU transfer
                                         stream.synchronize()
                                         chunk_bytes = pcm.cpu().numpy().tobytes()
                                     else:
                                         with torch.no_grad():
-                                            wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
+                                            wave = processor.mimi.decode(codes_dev)[0]
                                         chunk_bytes = (wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
                                     await websocket.send_json({"type": "audio_chunk", "size": len(chunk_bytes)})
                                     await websocket.send_bytes(chunk_bytes)

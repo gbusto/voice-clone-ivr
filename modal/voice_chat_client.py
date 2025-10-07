@@ -170,7 +170,7 @@ class VoiceChatClient:
                                         pending_audio.append(audio)
                                         # Prime when we have ~100 ms buffered
                                         total_len = sum(a.shape[0] for a in pending_audio)
-                                        if total_len >= int(0.1 * self.sample_rate):
+                                        if total_len >= int(0.2 * self.sample_rate):
                                             stream.start()
                                             primed = True
                                             # Flush buffer
