@@ -92,34 +92,57 @@ Raw WAV bytes with `Content-Type: audio/wav`
 - ✅ Auto-scaling with 2-minute window
 - ✅ Base64 JSON or raw WAV responses
 
-## 🔮 Next Steps: Real-Time WebSocket
+## 🎙️ Real-Time Voice Chat (NEW!)
 
-For the voice-to-voice chat app with WebSocket support, we'll need to:
+### Setup
 
-1. **Add WebSocket endpoint** to `lfm2_audio_modal.py`:
-   ```python
-   @app.function(gpu="T4", ...)
-   @modal.asgi_app()
-   def websocket_app():
-       # FastAPI with WebSocket support
-       # Maintain ChatState per connection
-       # Stream audio chunks bidirectionally
-   ```
+The WebSocket endpoint is now available! Use the Python client for voice conversations.
 
-2. **Session management**:
-   - Use in-memory dict with connection IDs
-   - Store `ChatState` per active connection
-   - Clean up on disconnect
+**1. Install client dependencies:**
 
-3. **Frontend WebSocket client** (Next.js):
-   - MediaRecorder API for audio capture
-   - WebSocket connection to Modal endpoint
-   - Real-time audio playback
+```bash
+pip install websockets sounddevice numpy pynput
+```
 
-4. **GPU optimization**:
-   - T4 can handle 2-4 simultaneous conversations
-   - Consider batching if needed
-   - Use longer `scaledown_window` for active sessions
+**2. Deploy the WebSocket endpoint:**
+
+```bash
+modal deploy lfm2_audio_modal.py
+```
+
+**3. Get your WebSocket URL:**
+
+Go to Modal dashboard and find the `voice_chat_ws` endpoint URL, or check:
+
+```bash
+modal app list
+```
+
+It will be something like:
+```
+wss://yourname--lfm2-audio-modal-voice-chat-ws.modal.run/ws
+```
+
+**4. Start voice chat:**
+
+```bash
+python modal/voice_chat_client.py --url "wss://yourname--lfm2-audio-modal-voice-chat-ws.modal.run/ws"
+```
+
+### How to Use
+
+- **Press and hold SPACE** to record your message
+- **Release SPACE** to send and get a response
+- **Press ESC** to exit
+
+The conversation history is maintained during your session!
+
+### Architecture
+
+- **WebSocket connection** - persistent, low-latency
+- **In-memory sessions** - each connection gets its own `ChatState`
+- **GPU efficiency** - 10-minute scaledown window keeps conversations fast
+- **Multi-user support** - handles up to 4 simultaneous conversations
 
 ## 💡 Performance Notes
 

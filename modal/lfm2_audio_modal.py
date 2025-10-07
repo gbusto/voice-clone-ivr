@@ -9,6 +9,7 @@ import io
 import json
 import base64
 from typing import Optional, Dict, Any
+import traceback
 
 app = modal.App("lfm2-audio-modal")
 
@@ -246,9 +247,16 @@ def tts_generate(request: Dict[str, Any]):
         with torch.no_grad():
             waveform = processor.mimi.decode(mimi_codes)[0]
         
-        # Convert to WAV bytes
+        # Convert to WAV bytes (force 16-bit PCM for client compatibility)
         wav_buffer = io.BytesIO()
-        torchaudio.save(wav_buffer, waveform.cpu(), 24000, format="wav")
+        torchaudio.save(
+            wav_buffer,
+            waveform.cpu(),
+            24000,
+            format="wav",
+            encoding="PCM_S",
+            bits_per_sample=16,
+        )
         wav_bytes = wav_buffer.getvalue()
     
     print(f"Generated text: {response_text[:100]}...")
@@ -268,6 +276,174 @@ def tts_generate(request: Dict[str, Any]):
     }
     
     return result
+
+
+# Global session storage for WebSocket connections
+CHAT_SESSIONS = {}
+
+# Global model cache for WebSocket endpoint
+WS_MODEL = None
+WS_PROCESSOR = None
+
+def _ensure_ws_model_loaded():
+    """Ensure model is loaded once for WebSocket endpoint"""
+    global WS_MODEL, WS_PROCESSOR
+    if WS_MODEL is None or WS_PROCESSOR is None:
+        print("Loading model for WebSocket endpoint...")
+        WS_MODEL, WS_PROCESSOR = _load_lfm2_model()
+        print("Model loaded and ready!")
+    return WS_MODEL, WS_PROCESSOR
+
+@app.function(
+    image=lfm2_image,
+    gpu="T4",
+    volumes={"/models": model_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    scaledown_window=600,  # Keep alive 10 minutes for conversations
+    timeout=1800,  # 30 minute max conversation
+    allow_concurrent_inputs=4,  # Support multiple simultaneous users
+)
+@modal.asgi_app(label="voice-chat-ws")
+def voice_chat_ws():
+    """WebSocket endpoint for real-time voice conversation"""
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse
+    import torch
+    import torchaudio
+    from liquid_audio import ChatState, LFMModality
+    import uuid
+    
+    # Load model once at startup (before any connections)
+    model, processor = _ensure_ws_model_loaded()
+    
+    web_app = FastAPI()
+    
+    @web_app.get("/")
+    async def root():
+        return {"status": "LFM2-Audio Voice Chat WebSocket", "endpoint": "/ws"}
+    
+    @web_app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        
+        # Create unique session
+        session_id = str(uuid.uuid4())[:8]
+        print(f"[{session_id}] New connection established")
+        
+        try:
+            
+            # Initialize chat state for this session
+            chat = ChatState(processor)
+            
+            # Add system prompt
+            chat.new_turn("system")
+            # NOTE: you *must* ask it to respond with interleaved text and audio. If not, it won't output audio properly (or we just get gibberish random data).
+            chat.add_text("You are a helpful voice assistant. Keep responses concise and natural. Please respond with interleaved text and audio.")
+            chat.end_turn()
+            
+            CHAT_SESSIONS[session_id] = {
+                "chat": chat,
+                "turn_count": 0
+            }
+            
+            # Send ready signal
+            await websocket.send_json({"type": "ready", "session_id": session_id})
+            
+            # Conversation loop
+            while True:
+                # Receive audio from client (WAV bytes)
+                data = await websocket.receive()
+                
+                if "bytes" in data:
+                    audio_bytes = data["bytes"]
+                    
+                    # Decode audio
+                    audio_buffer = io.BytesIO(audio_bytes)
+                    wav, sampling_rate = torchaudio.load(audio_buffer)
+                    
+                    # Add to chat state
+                    chat.new_turn("user")
+                    chat.add_audio(wav, sampling_rate)
+                    chat.end_turn()
+                    
+                    # Generate response
+                    chat.new_turn("assistant")
+                    
+                    text_out = []
+                    audio_out = []
+                    modality_out = []
+                    
+                    print(f"[{session_id}] Generating response...")
+                    
+                    with torch.no_grad():
+                        for t in model.generate_interleaved(
+                            **chat,
+                            max_new_tokens=512,
+                            audio_temperature=1.0,
+                            audio_top_k=4
+                        ):
+                            if t.numel() == 1:
+                                text_out.append(t)
+                                modality_out.append(LFMModality.TEXT)
+                            else:
+                                audio_out.append(t)
+                                modality_out.append(LFMModality.AUDIO_OUT)
+
+                    mimi_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
+                    with torch.no_grad():
+                        waveform = processor.mimi.decode(mimi_codes)[0]
+
+                    wav_buffer = io.BytesIO()
+                    torchaudio.save(
+                        wav_buffer,
+                        waveform.cpu(),
+                        24_000,
+                        format="wav",
+                    )
+
+                    chat.append(
+                        text = torch.stack(text_out, 1),
+                        audio_out = torch.stack(audio_out, 1),
+                        modality_flag = torch.tensor(modality_out)
+                    )
+                    chat.end_turn()
+                                        
+                    # Decode audio
+                    response_text = processor.text.decode(torch.cat(text_out)) if text_out else ""
+                    response_audio = wav_buffer.getvalue()
+
+                    await websocket.send_json({
+                        "type": "response",
+                        "text": response_text,
+                        "audio_size": len(response_audio)
+                    })
+                    await websocket.send_bytes(response_audio)
+                    
+                    print(f"[{session_id}] Sent response: {response_text[:50]}...")
+                                       
+                    CHAT_SESSIONS[session_id]["turn_count"] += 1
+                    
+                elif "text" in data:
+                    # Handle text messages (control commands)
+                    msg = json.loads(data["text"])
+                    if msg.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+        
+        except WebSocketDisconnect:
+            print(f"[{session_id}] Client disconnected")
+        except Exception as e:
+            # print stack trace
+            print(traceback.format_exc())
+            print(f"[{session_id}] Error: {e}")
+            await websocket.send_json({"type": "error", "message": str(e)})
+        finally:
+            # Cleanup
+            if session_id in CHAT_SESSIONS:
+                turns = CHAT_SESSIONS[session_id]["turn_count"]
+                del CHAT_SESSIONS[session_id]
+                print(f"[{session_id}] Session ended ({turns} turns)")
+    
+    return web_app
 
 
 @app.local_entrypoint()
