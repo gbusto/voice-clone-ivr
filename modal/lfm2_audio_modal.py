@@ -147,7 +147,7 @@ def _load_lfm2_model(model_path: str = "/models/lfm2-audio-1.5b"):
 
 @app.function(
     image=lfm2_image,
-    gpu="T4",  # T4 is sufficient for 1.5B model
+    gpu="H100",  # upgraded GPU
     volumes={"/models": model_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=2,  # Keep alive for 2 minutes after last request
@@ -296,7 +296,7 @@ def _ensure_ws_model_loaded():
 
 @app.function(
     image=lfm2_image,
-    gpu="T4",
+    gpu="A100-40GB",
     volumes={"/models": model_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=600,  # Keep alive 10 minutes for conversations
@@ -312,6 +312,7 @@ def voice_chat_ws():
     import torchaudio
     from liquid_audio import ChatState, LFMModality
     import uuid
+    import asyncio
     
     # Load model once at startup (before any connections)
     model, processor = _ensure_ws_model_loaded()
@@ -354,6 +355,22 @@ def voice_chat_ws():
                 "turn_count": 0
             }
             
+            # Utility: sanitize Mimi codes (remove EOS=2048 frames, clamp to [0,2047])
+            def _sanitize_codes(codes: "torch.Tensor") -> "torch.Tensor":
+                # codes shape: (codebooks, time) then unsqueezed to (1, codebooks, time)
+                if codes.ndim == 3:
+                    codes2 = codes.squeeze(0)
+                else:
+                    codes2 = codes
+                # mask out any time steps that contain EOS (2048) in any codebook
+                valid_mask = (codes2 < 2048).all(dim=0)
+                codes2 = codes2[:, valid_mask]
+                if codes2.numel() == 0:
+                    return codes2.new_empty((1, codes.shape[1] if codes.ndim==3 else codes.shape[0], 0))
+                # clamp just in case
+                codes2 = codes2.clamp_(min=0, max=2047).to(torch.long).contiguous()
+                return codes2.unsqueeze(0)
+
             # Send ready signal
             await websocket.send_json({"type": "ready", "session_id": session_id})
             
@@ -387,6 +404,42 @@ def voice_chat_ws():
                     chunk_stride = 8  # decode and send audio every N steps
                     pending_text = ""
 
+                    # Async decode queue and consumer to avoid blocking generation
+                    audio_queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+
+                    async def audio_consumer():
+                        # Dedicated CUDA stream (if available) to reduce contention
+                        stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+                        try:
+                            while True:
+                                item = await audio_queue.get()
+                                if item is None:
+                                    break
+                                slice_codes = item  # tensor on device or CPU
+                                if slice_codes.shape[2] <= 0:
+                                    continue
+                                try:
+                                    if stream is not None:
+                                        with torch.cuda.stream(stream):
+                                            wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
+                                            pcm = (wave.clamp(-1, 1) * 32767.0).to(torch.int16)
+                                        stream.synchronize()
+                                        chunk_bytes = pcm.cpu().numpy().tobytes()
+                                    else:
+                                        with torch.no_grad():
+                                            wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
+                                        chunk_bytes = (wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
+                                    await websocket.send_json({"type": "audio_chunk", "size": len(chunk_bytes)})
+                                    await websocket.send_bytes(chunk_bytes)
+                                except Exception as dec_err:
+                                    print(f"[{session_id}] Consumer decode error: {dec_err}")
+                                finally:
+                                    audio_queue.task_done()
+                        except Exception as e:
+                            print(f"[{session_id}] Audio consumer error: {e}")
+
+                    consumer_task = asyncio.create_task(audio_consumer())
+
                     print(f"[{session_id}] Generating response (streaming)...")
 
                     with torch.no_grad():
@@ -403,48 +456,37 @@ def voice_chat_ws():
                                 if delta:
                                     await websocket.send_json({"type": "text_delta", "delta": delta})
                                     pending_text += delta
-                                    # Flush audio at sentence boundaries
+                                    # Flush audio at sentence boundaries via queue
                                     if any(p in pending_text for p in ".!?") and len(audio_tokens) > last_sent_idx:
-                                        slice_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                        raw_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                        slice_codes = _sanitize_codes(raw_codes)
                                         if slice_codes.shape[2] > 0:
-                                            try:
-                                                with torch.no_grad():
-                                                    slice_wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
-                                                pcm_i16 = (slice_wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
-                                                await websocket.send_json({"type": "audio_chunk", "size": len(pcm_i16)})
-                                                await websocket.send_bytes(pcm_i16)
-                                                last_sent_idx = len(audio_tokens)
-                                                pending_text = ""  # reset after a sentence flush
-                                            except Exception as dec_err:
-                                                print(f"[{session_id}] Slice decode error: {dec_err}")
+                                            await audio_queue.put(slice_codes)
+                                        last_sent_idx = len(audio_tokens)
+                                        pending_text = ""
                             else:
-                                # Audio token: accumulate and stream in chunks
+                                # Audio token: accumulate and stream in chunks via queue
                                 audio_tokens.append(t)
                                 if len(audio_tokens) - last_sent_idx >= chunk_stride:
-                                    slice_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                    raw_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                    slice_codes = _sanitize_codes(raw_codes)
                                     if slice_codes.shape[2] > 0:
-                                        try:
-                                            with torch.no_grad():
-                                                slice_wave = processor.mimi.decode(slice_codes.to(torch.long).contiguous())[0]
-                                            pcm_i16 = (slice_wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
-                                            await websocket.send_json({"type": "audio_chunk", "size": len(pcm_i16)})
-                                            await websocket.send_bytes(pcm_i16)
-                                            last_sent_idx = len(audio_tokens)
-                                        except Exception as dec_err:
-                                            print(f"[{session_id}] Chunk decode error: {dec_err}")
+                                        await audio_queue.put(slice_codes)
+                                    last_sent_idx = len(audio_tokens)
 
                     # Flush remaining audio (excluding trailing end-of-audio code)
                     if len(audio_tokens) > last_sent_idx + 1:
-                        final_codes = torch.stack(audio_tokens[last_sent_idx:-1], 1).unsqueeze(0)
+                        raw_final = torch.stack(audio_tokens[last_sent_idx:-1], 1).unsqueeze(0)
+                        final_codes = _sanitize_codes(raw_final)
                         if final_codes.shape[2] > 0:
-                            try:
-                                with torch.no_grad():
-                                    final_wave = processor.mimi.decode(final_codes.to(torch.long).contiguous())[0]
-                                final_pcm = (final_wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
-                                await websocket.send_json({"type": "audio_chunk", "size": len(final_pcm)})
-                                await websocket.send_bytes(final_pcm)
-                            except Exception as dec_err:
-                                print(f"[{session_id}] Final decode error: {dec_err}")
+                            await audio_queue.put(final_codes)
+
+                    # Signal consumer to finish and wait for it
+                    await audio_queue.put(None)
+                    try:
+                        await asyncio.wait_for(consumer_task, timeout=5)
+                    except asyncio.TimeoutError:
+                        consumer_task.cancel()
 
                     # Append generated tokens to chat history
                     if text_tokens or audio_tokens:

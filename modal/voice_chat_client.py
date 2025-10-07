@@ -152,9 +152,10 @@ class VoiceChatClient:
                             # Stream response
                             print("⏳ Waiting for response (streaming)...")
 
-                            # Open output stream for low-latency playback
+                            # Open output stream; add a small jitter buffer before playback
                             stream = sd.OutputStream(samplerate=self.sample_rate, channels=1, dtype='float32')
-                            stream.start()
+                            pending_audio = []
+                            primed = False
 
                             accumulated_text = []
                             while True:
@@ -165,7 +166,19 @@ class VoiceChatClient:
                                     # Binary frame (raw PCM S16LE)
                                     pcm = msg
                                     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                                    stream.write(audio.reshape(-1, 1))
+                                    if not primed:
+                                        pending_audio.append(audio)
+                                        # Prime when we have ~100 ms buffered
+                                        total_len = sum(a.shape[0] for a in pending_audio)
+                                        if total_len >= int(0.1 * self.sample_rate):
+                                            stream.start()
+                                            primed = True
+                                            # Flush buffer
+                                            for a in pending_audio:
+                                                stream.write(a.reshape(-1, 1))
+                                            pending_audio = []
+                                    else:
+                                        stream.write(audio.reshape(-1, 1))
                                     continue
 
                                 mtype = data.get("type")
@@ -178,11 +191,15 @@ class VoiceChatClient:
                                     # size metadata; actual bytes will arrive next frame (binary)
                                     pass
                                 elif mtype == "response_end":
-                                    stream.stop(); stream.close()
+                                    if primed:
+                                        stream.stop()
+                                    stream.close()
                                     print("\n✨ Done!\n")
                                     break
                                 elif mtype == "error":
-                                    stream.stop(); stream.close()
+                                    if primed:
+                                        stream.stop()
+                                    stream.close()
                                     print(f"❌ Error: {data.get('message')}")
                                     break
                         
