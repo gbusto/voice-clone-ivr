@@ -21,6 +21,21 @@ except ImportError:
     sys.exit(1)
 
 
+def now_epoch_ms() -> int:
+    import time
+    return int(time.time() * 1000)
+
+
+def normalize_latency_ms(lat_ms: int) -> int:
+    """If clocks are skewed (e.g., >1h), drop whole-hour multiples and keep remainder."""
+    HOUR = 3600 * 1000
+    if lat_ms >= HOUR:
+        return lat_ms % HOUR
+    if lat_ms <= -HOUR:
+        return -((-lat_ms) % HOUR)
+    return lat_ms
+
+
 class VoiceChatClient:
     def __init__(self, ws_url: str, sample_rate: int = 24000, show_metrics: bool = False):
         self.ws_url = ws_url
@@ -154,15 +169,32 @@ class VoiceChatClient:
                             print("⏳ Waiting for response (streaming)...")
 
                             # Open output stream; add a small jitter buffer before playback
-                            stream = sd.OutputStream(samplerate=self.sample_rate, channels=1, dtype='float32')
+                            stream = sd.OutputStream(
+                                samplerate=self.sample_rate,
+                                channels=1,
+                                dtype='float32',
+                                blocksize=240,  # ~10 ms at 24 kHz
+                                latency='low'
+                            )
                             pending_audio = []
                             primed = False
+                            first_audio_hdr_server_ms = None
+                            first_audio_hdr_client_ms = None
+                            first_play_printed = False
 
                             accumulated_text = []
                             while True:
                                 msg = await websocket.recv()
                                 try:
                                     data = json.loads(msg)
+                                    recv_ms = now_epoch_ms()
+                                    ts_ms = data.get("ts_ms")
+                                    lat_ms = None
+                                    if ts_ms is not None:
+                                        try:
+                                            lat_ms = normalize_latency_ms(recv_ms - int(ts_ms))
+                                        except Exception:
+                                            lat_ms = None
                                 except Exception:
                                     # Binary frame (raw PCM S16LE)
                                     pcm = msg
@@ -174,6 +206,19 @@ class VoiceChatClient:
                                         if total_len >= int(0.05 * self.sample_rate):
                                             stream.start()
                                             primed = True
+                                            if self.show_metrics and not first_play_printed:
+                                                play_ms_cli = None
+                                                play_ms_srv = None
+                                                now_ms = now_epoch_ms()
+                                                if first_audio_hdr_client_ms is not None:
+                                                    play_ms_cli = normalize_latency_ms(now_ms - first_audio_hdr_client_ms)
+                                                if first_audio_hdr_server_ms is not None:
+                                                    play_ms_srv = normalize_latency_ms(now_ms - first_audio_hdr_server_ms)
+                                                if play_ms_srv is not None:
+                                                    print(f"[play {play_ms_srv} ms from server_hdr]")
+                                                elif play_ms_cli is not None:
+                                                    print(f"[play {play_ms_cli} ms from client_hdr]")
+                                                first_play_printed = True
                                             # Flush buffer
                                             for a in pending_audio:
                                                 stream.write(a.reshape(-1, 1))
@@ -183,22 +228,40 @@ class VoiceChatClient:
                                     continue
 
                                 mtype = data.get("type")
+                                if mtype == "response_start":
+                                    if self.show_metrics and lat_ms is not None:
+                                        print(f"[start {lat_ms} ms]")
+                                
                                 if mtype == "text_delta":
                                     delta = data.get("delta", "")
+                                    if self.show_metrics and lat_ms is not None:
+                                        print(f"[text {lat_ms} ms]")
                                     accumulated_text.append(delta)
                                     sys.stdout.write(delta)
                                     sys.stdout.flush()
                                 elif mtype == "audio_chunk":
                                     # size metadata; actual bytes will arrive next frame (binary)
+                                    if self.show_metrics and lat_ms is not None:
+                                        print(f"[audio_hdr {lat_ms} ms] size={data.get('size')}")
+                                    if first_audio_hdr_client_ms is None:
+                                        first_audio_hdr_client_ms = recv_ms
+                                        try:
+                                            first_audio_hdr_server_ms = int(ts_ms) if ts_ms is not None else None
+                                        except Exception:
+                                            first_audio_hdr_server_ms = None
                                     pass
                                 elif mtype == "response_end":
                                     if primed:
                                         stream.stop()
                                     stream.close()
+                                    if self.show_metrics and lat_ms is not None:
+                                        print(f"[end {lat_ms} ms]")
                                     print("\n✨ Done!\n")
                                     break
                                 elif mtype == "metrics":
                                     if self.show_metrics:
+                                        if lat_ms is not None:
+                                            print(f"\n📊 WS latency (server→client): {lat_ms} ms")
                                         metrics = {k: data.get(k) for k in sorted(data.keys()) if k != "type"}
                                         print("\n📊 Metrics:")
                                         for k, v in metrics.items():

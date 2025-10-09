@@ -112,15 +112,25 @@ MODEL = None
 PROCESSOR = None
 
 
-# Lightweight tracing/profiling controls
-TRACE_ENABLED = True# os.environ.get("LFM2_TRACE", "0") not in ("0", "false", "False", "")
+# =============================================================================
+# Tracing and profiling utilities
+# =============================================================================
+
+TRACE_ENABLED = os.environ.get("LFM2_TRACE", "0") not in ("0", "false", "False", "")
 
 
 def _now_ms() -> float:
+    """Return current time in milliseconds (monotonic)"""
     return time.perf_counter() * 1000.0
 
 
+def _now_epoch_ms() -> int:
+    """Return wall-clock epoch time in milliseconds (for cross-machine latency)."""
+    return int(time.time() * 1000)
+
+
 class _Timer:
+    """Context manager for timing code blocks"""
     def __init__(self, name: str, metrics: Dict[str, Any]):
         self.name = name
         self.metrics = metrics
@@ -136,8 +146,62 @@ class _Timer:
 
 
 def _trace_print(*args, **kwargs):
+    """Print only when tracing is enabled"""
     if TRACE_ENABLED:
         print("[TRACE]", *args, **kwargs)
+
+
+# =============================================================================
+# MIMI codec utilities
+# =============================================================================
+
+MIMI_EOS = 2048  # End-of-stream token for MIMI codec
+MIMI_MAX_CODE = 2047  # Maximum valid code value
+
+
+def sanitize_mimi_codes(codes: "torch.Tensor") -> "torch.Tensor":
+    """
+    Remove EOS frames and clamp MIMI codes to valid range.
+    
+    Input: (1, codebooks, time) or (codebooks, time)
+    Output: (1, codebooks, time) with EOS frames removed and codes in [0, 2047]
+    
+    Removes any timestep where ANY codebook contains EOS (2048).
+    """
+    import torch
+    
+    # Normalize to (codebooks, time)
+    if codes.ndim == 3:
+        codes2 = codes.squeeze(0)
+    else:
+        codes2 = codes
+    
+    # Mask out timesteps containing EOS in any codebook
+    valid_mask = (codes2 < MIMI_EOS).all(dim=0)
+    codes2 = codes2[:, valid_mask]
+    
+    # Return empty if no valid frames
+    if codes2.numel() == 0:
+        return codes2.new_empty((1, codes.shape[1] if codes.ndim == 3 else codes.shape[0], 0))
+    
+    # Clamp and ensure proper format
+    codes2 = codes2.clamp_(min=0, max=MIMI_MAX_CODE).to(torch.long).contiguous()
+    return codes2.unsqueeze(0)
+
+
+def _setup_torch_optimizations():
+    """Configure PyTorch for optimal inference performance"""
+    import torch
+    
+    if torch.cuda.is_available():
+        # Enable TF32 for faster matmul on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        print("PyTorch optimizations enabled (TF32, high precision)")
 
 
 def _load_lfm2_model(model_path: str = "/models/lfm2-audio-1.5b"):
@@ -157,6 +221,9 @@ def _load_lfm2_model(model_path: str = "/models/lfm2-audio-1.5b"):
     import torch
     from pathlib import Path
     from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
+    
+    # Setup optimizations once
+    _setup_torch_optimizations()
     
     print(f"Loading model from {model_path}...")
     
@@ -365,28 +432,68 @@ def voice_chat_ws():
     
     # Load model once at startup (before any connections)
     model, processor = _ensure_ws_model_loaded()
-    # Enable fast math on supported GPUs
-    import torch
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
     
     # Warm up MIMI decoder (first decode is slow)
     print("Warming up MIMI decoder...")
     try:
-        dummy_codes = torch.randint(0, 2048, (1, 8, 10), dtype=torch.long)
+        dummy_codes = torch.randint(0, MIMI_EOS, (1, 8, 10), dtype=torch.long)
         if torch.cuda.is_available():
             dummy_codes = dummy_codes.cuda()
-        with torch.no_grad():
+        with torch.inference_mode():
             _ = processor.mimi.decode(dummy_codes)
         print("MIMI decoder warmed up!")
     except Exception as e:
         print(f"MIMI warmup failed (non-critical): {e}")
     
     web_app = FastAPI()
+    
+    # =========================================================================
+    # WebSocket helper functions (thread-safe message sending)
+    # =========================================================================
+    
+    async def ws_send_json(ws: WebSocket, send_lock: asyncio.Lock, payload: dict):
+        """Thread-safe JSON message send with server timestamp"""
+        msg = dict(payload)
+        msg.setdefault("ts_ms", _now_epoch_ms())
+        async with send_lock:
+            await ws.send_json(msg)
+    
+    async def ws_send_audio_chunk(ws: WebSocket, send_lock: asyncio.Lock, pcm_bytes: bytes):
+        """Thread-safe audio chunk send (size header + bytes) with server timestamp"""
+        header = {"type": "audio_chunk", "size": len(pcm_bytes), "ts_ms": _now_epoch_ms()}
+        async with send_lock:
+            await ws.send_json(header)
+            await ws.send_bytes(pcm_bytes)
+    
+    async def send_response_start(ws: WebSocket, send_lock: asyncio.Lock):
+        """Send response start message"""
+        await ws_send_json(ws, send_lock, {
+            "type": "response_start",
+            "audio": {"sample_rate": 24000, "format": "pcm_s16"}
+        })
+    
+    async def send_text_delta(ws: WebSocket, send_lock: asyncio.Lock, delta: str):
+        """Send text delta message"""
+        await ws_send_json(ws, send_lock, {"type": "text_delta", "delta": delta})
+    
+    async def send_response_end(ws: WebSocket, send_lock: asyncio.Lock, text: str):
+        """Send response end message"""
+        await ws_send_json(ws, send_lock, {"type": "response_end", "text": text})
+    
+    async def send_metrics(ws: WebSocket, send_lock: asyncio.Lock, metrics: dict):
+        """Send metrics message (only when tracing is enabled)"""
+        if TRACE_ENABLED:
+            await ws_send_json(ws, send_lock, {"type": "metrics", **metrics})
+    
+    async def drain_consumers(text_task, audio_task, text_q, audio_q, timeout=10):
+        """Gracefully shutdown consumer tasks"""
+        text_q.put_nowait(None)
+        audio_q.put_nowait(None)
+        try:
+            await asyncio.wait_for(asyncio.gather(text_task, audio_task), timeout=timeout)
+        except asyncio.TimeoutError:
+            text_task.cancel()
+            audio_task.cancel()
     
     @web_app.get("/")
     async def root():
@@ -399,9 +506,17 @@ def voice_chat_ws():
         # Create unique session
         session_id = str(uuid.uuid4())[:8]
         print(f"[{session_id}] New connection established")
+        # Per-connection tracing toggle via query param (?trace=1)
+        try:
+            qp = websocket.query_params
+            trace_on = str(qp.get("trace", "0")).lower() in ("1", "true", "yes", "on")
+        except Exception:
+            trace_on = False
+        
+        # WebSocket send lock (prevents concurrent writes from text/audio consumers)
+        send_lock = asyncio.Lock()
         
         try:
-            
             # Initialize chat state for this session
             chat = ChatState(processor)
             
@@ -415,25 +530,9 @@ def voice_chat_ws():
                 "chat": chat,
                 "turn_count": 0
             }
-            
-            # Utility: sanitize Mimi codes (remove EOS=2048 frames, clamp to [0,2047])
-            def _sanitize_codes(codes: "torch.Tensor") -> "torch.Tensor":
-                # codes shape: (codebooks, time) then unsqueezed to (1, codebooks, time)
-                if codes.ndim == 3:
-                    codes2 = codes.squeeze(0)
-                else:
-                    codes2 = codes
-                # mask out any time steps that contain EOS (2048) in any codebook
-                valid_mask = (codes2 < 2048).all(dim=0)
-                codes2 = codes2[:, valid_mask]
-                if codes2.numel() == 0:
-                    return codes2.new_empty((1, codes.shape[1] if codes.ndim==3 else codes.shape[0], 0))
-                # clamp just in case
-                codes2 = codes2.clamp_(min=0, max=2047).to(torch.long).contiguous()
-                return codes2.unsqueeze(0)
 
             # Send ready signal
-            await websocket.send_json({"type": "ready", "session_id": session_id})
+            await ws_send_json(websocket, send_lock, {"type": "ready", "session_id": session_id})
             
             # Conversation loop
             while True:
@@ -456,15 +555,18 @@ def voice_chat_ws():
                     
                     # Generate and stream response
                     chat.new_turn("assistant")
-                    await websocket.send_json({
-                        "type": "response_start",
-                        "audio": {"sample_rate": 24000, "format": "pcm_s16"}
-                    })
+                    await send_response_start(websocket, send_lock)
 
                     text_tokens = []
                     audio_tokens = []
                     last_sent_idx = 0
-                    chunk_stride = 16  # decode and send audio every N steps
+                    # Adaptive stride: start small for lower TTFX, then ramp up
+                    normal_stride = 16
+                    current_stride = 4
+                    small_flushes_remaining = 2
+                    first_audio_flushed = False
+                    # NOTE: unbounded queues could grow large if downstream stalls.
+                    # Consider adaptive coalescing or bounded queue with smarter dropping in production.
                     pending_text = ""
                     last_enqueued_sig: Optional[str] = None
 
@@ -472,14 +574,15 @@ def voice_chat_ws():
                     text_queue: asyncio.Queue = asyncio.Queue()
                     audio_queue: asyncio.Queue = asyncio.Queue()
                     
-                    decode_metrics = {"chunks": 0, "bytes": 0, "decode_ms": 0.0, "mimi_decode_ms": 0.0, "network_send_ms": 0.0}
-                    text_metrics = {"text_deltas_sent": 0, "text_send_ms": 0.0}
-                    gen_metrics = {
-                        "tokens_generated": 0,
-                        "queue_put_ms": 0.0,
-                        "sanitize_ms": 0.0,
-                        "actual_generation_ms": 0.0,
-                    }
+                    # Metrics (lean set when not tracing)
+                    decode_metrics = {"chunks": 0, "bytes": 0}
+                    text_metrics = {"text_deltas_sent": 0}
+                    gen_metrics = {"tokens_generated": 0, "tokens_before_first_audio": 0}
+                    
+                    if TRACE_ENABLED:
+                        decode_metrics.update({"decode_ms": 0.0, "mimi_decode_ms": 0.0, "network_send_ms": 0.0})
+                        text_metrics.update({"text_send_ms": 0.0})
+                        gen_metrics.update({"queue_put_ms": 0.0, "sanitize_ms": 0.0, "actual_generation_ms": 0.0})
 
                     async def text_consumer():
                         """Consumes text deltas and sends over WebSocket"""
@@ -489,9 +592,11 @@ def voice_chat_ws():
                                 if delta is None:
                                     break
                                 try:
-                                    t_send_start = _now_ms()
-                                    await websocket.send_json({"type": "text_delta", "delta": delta})
-                                    text_metrics["text_send_ms"] += _now_ms() - t_send_start
+                                    if TRACE_ENABLED:
+                                        t_send_start = _now_ms()
+                                    await send_text_delta(websocket, send_lock, delta)
+                                    if TRACE_ENABLED:
+                                        text_metrics["text_send_ms"] += _now_ms() - t_send_start
                                     text_metrics["text_deltas_sent"] += 1
                                 except Exception as e:
                                     print(f"[{session_id}] Text consumer error: {e}")
@@ -513,34 +618,38 @@ def voice_chat_ws():
                                 if slice_codes.shape[2] <= 0:
                                     continue
                                 try:
-                                    t_total_start = _now_ms()
+                                    t_total_start = _now_ms() if TRACE_ENABLED else 0
                                     
                                     # MIMI decode on separate CUDA stream
-                                    t_mimi_start = _now_ms()
+                                    t_mimi_start = _now_ms() if TRACE_ENABLED else 0
                                     target_device = processor.device if hasattr(processor, "device") else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
                                     codes_dev = slice_codes.to(device=target_device, dtype=torch.long, non_blocking=True).contiguous()
                                     if stream is not None:
                                         with torch.cuda.stream(stream):
-                                            wave = processor.mimi.decode(codes_dev)[0]
-                                            pcm = (wave.clamp(-1, 1) * 32767.0).to(torch.int16)
+                                            with torch.inference_mode():
+                                                wave = processor.mimi.decode(codes_dev)[0]
+                                                pcm = (wave.clamp(-1, 1) * 32767.0).to(torch.int16)
                                         # ensure decode finished before CPU transfer
                                         stream.synchronize()
                                         chunk_bytes = pcm.cpu().numpy().tobytes()
                                     else:
-                                        with torch.no_grad():
+                                        with torch.inference_mode():
                                             wave = processor.mimi.decode(codes_dev)[0]
                                         chunk_bytes = (wave.clamp(-1, 1) * 32767.0).to(torch.int16).cpu().numpy().tobytes()
-                                    decode_metrics["mimi_decode_ms"] += _now_ms() - t_mimi_start
                                     
-                                    # Network send
-                                    t_send_start = _now_ms()
-                                    await websocket.send_json({"type": "audio_chunk", "size": len(chunk_bytes)})
-                                    await websocket.send_bytes(chunk_bytes)
-                                    decode_metrics["network_send_ms"] += _now_ms() - t_send_start
+                                    if TRACE_ENABLED:
+                                        decode_metrics["mimi_decode_ms"] += _now_ms() - t_mimi_start
+                                    
+                                    # Network send (thread-safe)
+                                    t_send_start = _now_ms() if TRACE_ENABLED else 0
+                                    await ws_send_audio_chunk(websocket, send_lock, chunk_bytes)
+                                    if TRACE_ENABLED:
+                                        decode_metrics["network_send_ms"] += _now_ms() - t_send_start
                                     
                                     decode_metrics["chunks"] += 1
                                     decode_metrics["bytes"] += len(chunk_bytes)
-                                    decode_metrics["decode_ms"] += _now_ms() - t_total_start
+                                    if TRACE_ENABLED:
+                                        decode_metrics["decode_ms"] += _now_ms() - t_total_start
                                 except Exception as dec_err:
                                     print(f"[{session_id}] Audio consumer decode error: {dec_err}")
                                 finally:
@@ -554,18 +663,21 @@ def voice_chat_ws():
 
                     print(f"[{session_id}] Generating response (streaming)...")
 
-                    t_gen_start = _now_ms()
+                    t_gen_start = _now_ms() if TRACE_ENABLED else 0
+                    request_start_ms = t_gen_start if TRACE_ENABLED else _now_ms()
                     t_last_token = t_gen_start
-                    with torch.no_grad():
+                    first_audio_seen = False
+                    with torch.inference_mode():
                         for t in model.generate_interleaved(
                             **chat,
                             max_new_tokens=512,
-                            audio_temperature=1.0,
-                            audio_top_k=4,
+                            audio_temperature=0.8,
+                            audio_top_k=2,
                         ):
                             # Measure time since last token (actual generation time)
-                            t_now = _now_ms()
-                            gen_metrics["actual_generation_ms"] += t_now - t_last_token
+                            if TRACE_ENABLED:
+                                t_now = _now_ms()
+                                gen_metrics["actual_generation_ms"] += t_now - t_last_token
                             gen_metrics["tokens_generated"] += 1
                             
                             if t.numel() == 1:
@@ -573,73 +685,115 @@ def voice_chat_ws():
                                 text_tokens.append(t)
                                 delta = processor.text.decode(t)
                                 if delta:
+                                    # Count text tokens before first audio appears
+                                    if not first_audio_seen:
+                                        gen_metrics["tokens_before_first_audio"] += 1
                                     # Enqueue text delta (non-blocking)
-                                    t_put_start = _now_ms()
+                                    if TRACE_ENABLED:
+                                        t_put_start = _now_ms()
                                     text_queue.put_nowait(delta)
-                                    gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
+                                    if TRACE_ENABLED:
+                                        gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
+                                    # Yield to allow text consumer to send immediately
+                                    # (prevents event-loop starvation during fast generation)
+                                    await asyncio.sleep(0)
                                     
                                     pending_text += delta
-                                    # Flush audio at sentence boundaries via queue
-                                    if any(p in pending_text for p in ".!?") and len(audio_tokens) > last_sent_idx:
-                                        t_san_start = _now_ms()
+                                    # Flush audio at sentence boundaries via queue (skip until first audio flush occurs)
+                                    if any(p in pending_text for p in ".!?") and len(audio_tokens) > last_sent_idx and first_audio_flushed:
+                                        if TRACE_ENABLED:
+                                            t_san_start = _now_ms()
                                         raw_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
-                                        slice_codes = _sanitize_codes(raw_codes)
-                                        gen_metrics["sanitize_ms"] += _now_ms() - t_san_start
+                                        slice_codes = sanitize_mimi_codes(raw_codes)
+                                        if TRACE_ENABLED:
+                                            gen_metrics["sanitize_ms"] += _now_ms() - t_san_start
                                         
                                         if slice_codes.shape[2] > 0:
                                             sig = f"{last_sent_idx}:{len(audio_tokens)}:{slice_codes.shape[2]}"
                                             if sig != last_enqueued_sig:
-                                                t_put_start = _now_ms()
+                                                if TRACE_ENABLED:
+                                                    t_put_start = _now_ms()
                                                 audio_queue.put_nowait(slice_codes)
-                                                gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
+                                                if TRACE_ENABLED:
+                                                    gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
                                                 last_enqueued_sig = sig
+                                            # Allow audio consumer to begin decoding
+                                            await asyncio.sleep(0)
                                         last_sent_idx = len(audio_tokens)
                                         pending_text = ""
                             else:
                                 # Audio token: accumulate and enqueue in chunks
                                 audio_tokens.append(t)
-                                if len(audio_tokens) - last_sent_idx >= chunk_stride:
-                                    t_san_start = _now_ms()
+                                if not first_audio_seen:
+                                    first_audio_seen = True
+                                # First-audio fast path: flush as soon as a few frames are available
+                                if (not first_audio_flushed) and (len(audio_tokens) - last_sent_idx >= 4):
+                                    if TRACE_ENABLED:
+                                        t_san_start = _now_ms()
                                     raw_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
-                                    slice_codes = _sanitize_codes(raw_codes)
-                                    gen_metrics["sanitize_ms"] += _now_ms() - t_san_start
+                                    slice_codes = sanitize_mimi_codes(raw_codes)
+                                    if TRACE_ENABLED:
+                                        gen_metrics["sanitize_ms"] += _now_ms() - t_san_start
+                                    if slice_codes.shape[2] > 0:
+                                        sig = f"{last_sent_idx}:{len(audio_tokens)}:{slice_codes.shape[2]}"
+                                        if sig != last_enqueued_sig:
+                                            if TRACE_ENABLED:
+                                                t_put_start = _now_ms()
+                                            audio_queue.put_nowait(slice_codes)
+                                            if TRACE_ENABLED:
+                                                gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
+                                            last_enqueued_sig = sig
+                                            await asyncio.sleep(0)
+                                    last_sent_idx = len(audio_tokens)
+                                    first_audio_flushed = True
+
+                                # Adaptive stride after first flush
+                                elif len(audio_tokens) - last_sent_idx >= current_stride:
+                                    if TRACE_ENABLED:
+                                        t_san_start = _now_ms()
+                                    raw_codes = torch.stack(audio_tokens[last_sent_idx:], 1).unsqueeze(0)
+                                    slice_codes = sanitize_mimi_codes(raw_codes)
+                                    if TRACE_ENABLED:
+                                        gen_metrics["sanitize_ms"] += _now_ms() - t_san_start
                                     
                                     if slice_codes.shape[2] > 0:
                                         sig = f"{last_sent_idx}:{len(audio_tokens)}:{slice_codes.shape[2]}"
                                         if sig != last_enqueued_sig:
-                                            t_put_start = _now_ms()
+                                            if TRACE_ENABLED:
+                                                t_put_start = _now_ms()
                                             audio_queue.put_nowait(slice_codes)
-                                            gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
+                                            if TRACE_ENABLED:
+                                                gen_metrics["queue_put_ms"] += _now_ms() - t_put_start
                                             last_enqueued_sig = sig
+                                            await asyncio.sleep(0)
                                     last_sent_idx = len(audio_tokens)
+                                    if small_flushes_remaining > 0:
+                                        current_stride = min(normal_stride, max(current_stride * 2, 4))
+                                        small_flushes_remaining -= 1
                             
-                            t_last_token = _now_ms()
+                            if TRACE_ENABLED:
+                                t_last_token = _now_ms()
                     
                     # Generation complete - measure pure generation time
-                    gen_loop_ms = _now_ms() - t_gen_start
+                    gen_loop_ms = (_now_ms() - t_gen_start) if TRACE_ENABLED else 0
 
                     # Flush remaining audio (excluding trailing end-of-audio code)
                     if len(audio_tokens) > last_sent_idx + 1:
                         raw_final = torch.stack(audio_tokens[last_sent_idx:-1], 1).unsqueeze(0)
-                        final_codes = _sanitize_codes(raw_final)
+                        final_codes = sanitize_mimi_codes(raw_final)
                         if final_codes.shape[2] > 0:
                             sig = f"{last_sent_idx}:{len(audio_tokens)-1}:{final_codes.shape[2]}"
                             if sig != last_enqueued_sig:
                                 audio_queue.put_nowait(final_codes)
                                 last_enqueued_sig = sig
 
-                    # Signal consumers to finish and wait for them
-                    text_queue.put_nowait(None)
-                    audio_queue.put_nowait(None)
+                    # Gracefully drain and shutdown consumers
+                    t_consumer_wait_start = _now_ms() if TRACE_ENABLED else 0
+                    await drain_consumers(text_consumer_task, audio_consumer_task, text_queue, audio_queue)
+                    consumer_wait_ms = (_now_ms() - t_consumer_wait_start) if TRACE_ENABLED else 0
                     
-                    t_consumer_wait_start = _now_ms()
-                    try:
-                        await asyncio.wait_for(asyncio.gather(text_consumer_task, audio_consumer_task), timeout=10)
-                    except asyncio.TimeoutError:
-                        text_consumer_task.cancel()
-                        audio_consumer_task.cancel()
-                    consumer_wait_ms = _now_ms() - t_consumer_wait_start
-                    _trace_print(f"[{session_id}] gen_loop_ms={gen_loop_ms:.1f} recv_decode_ms={recv_decode_ms:.1f} chunks={decode_metrics['chunks']} bytes={decode_metrics['bytes']} decode_ms={decode_metrics['decode_ms']:.1f}")
+                    if TRACE_ENABLED:
+                        _trace_print(f"[{session_id}] gen_loop_ms={gen_loop_ms:.1f} consumer_wait_ms={consumer_wait_ms:.1f} chunks={decode_metrics['chunks']} bytes={decode_metrics['bytes']}")
 
                     # Append generated tokens to chat history
                     if text_tokens or audio_tokens:
@@ -652,22 +806,27 @@ def voice_chat_ws():
                     chat.end_turn()
 
                     full_text = processor.text.decode(torch.cat(text_tokens)) if text_tokens else ""
-                    await websocket.send_json({"type": "response_end", "text": full_text})
-                    if TRACE_ENABLED:
-                        await websocket.send_json({
+                    await send_response_end(websocket, send_lock, full_text)
+                    
+                    # Send detailed metrics when tracing is enabled or requested via query param
+                    if TRACE_ENABLED or trace_on:
+                        await ws_send_json(websocket, send_lock, {
                             "type": "metrics",
                             "gen_loop_ms": gen_loop_ms,
-                            "gen_actual_generation_ms": gen_metrics["actual_generation_ms"],
-                            "gen_queue_put_ms": gen_metrics["queue_put_ms"],
-                            "gen_sanitize_ms": gen_metrics["sanitize_ms"],
+                            "gen_actual_generation_ms": gen_metrics.get("actual_generation_ms", 0),
+                            "gen_queue_put_ms": gen_metrics.get("queue_put_ms", 0),
+                            "gen_sanitize_ms": gen_metrics.get("sanitize_ms", 0),
                             "gen_tokens_generated": gen_metrics["tokens_generated"],
+                            "tokens_before_first_audio": gen_metrics.get("tokens_before_first_audio", 0),
                             "consumer_wait_ms": consumer_wait_ms,
                             "recv_decode_ms": recv_decode_ms,
-                            "text_consumer_send_ms": text_metrics["text_send_ms"],
+                            "text_consumer_send_ms": text_metrics.get("text_send_ms", 0),
                             "text_consumer_deltas_sent": text_metrics["text_deltas_sent"],
-                            "audio_consumer_total_ms": decode_metrics["decode_ms"],
-                            "audio_consumer_mimi_decode_ms": decode_metrics["mimi_decode_ms"],
-                            "audio_consumer_network_send_ms": decode_metrics["network_send_ms"],
+                            "t_first_text_delta_ms": text_metrics.get("first_text_ms"),
+                            "t_first_audio_bytes_ms": decode_metrics.get("first_audio_ms"),
+                            "audio_consumer_total_ms": decode_metrics.get("decode_ms", 0),
+                            "audio_consumer_mimi_decode_ms": decode_metrics.get("mimi_decode_ms", 0),
+                            "audio_consumer_network_send_ms": decode_metrics.get("network_send_ms", 0),
                             "audio_consumer_chunks": decode_metrics["chunks"],
                             "audio_consumer_bytes": decode_metrics["bytes"],
                             "num_text_tokens": len(text_tokens),
@@ -681,7 +840,7 @@ def voice_chat_ws():
                     # Handle text messages (control commands)
                     msg = json.loads(data["text"])
                     if msg.get("type") == "ping":
-                        await websocket.send_json({"type": "pong"})
+                        await ws_send_json(websocket, send_lock, {"type": "pong"})
         
         except WebSocketDisconnect:
             print(f"[{session_id}] Client disconnected")
@@ -689,7 +848,10 @@ def voice_chat_ws():
             # print stack trace
             print(traceback.format_exc())
             print(f"[{session_id}] Error: {e}")
-            await websocket.send_json({"type": "error", "message": str(e)})
+            try:
+                await ws_send_json(websocket, send_lock, {"type": "error", "message": str(e)})
+            except:
+                pass  # Ignore if websocket is already closed
         finally:
             # Cleanup
             if session_id in CHAT_SESSIONS:
